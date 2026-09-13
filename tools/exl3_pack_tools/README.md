@@ -10,7 +10,8 @@ before vLLM can load it.
 - `qwen_pack_scan.py` inventories every tensor in the pack by reading each
   `*.safetensors` header only (no tensor data). It reports, per MoE layer,
   the set of K values across experts for gate/up/down (non-uniform expert K
-  is supported via ragged trellis storage + python_loop); per dense linear
+  is supported via ragged trellis storage and one grouped `exl3_moe` launch
+  per physical K triple, with the LinearEXL3 loop as fallback); per dense linear
   (attention, dense MLP, shared expert, `lm_head`), its K; and for each
   row-wise n-gram embedding table, its shard count, row count, K and
   auxiliary tensors. Writes `pack_scan.json` next to the pack.

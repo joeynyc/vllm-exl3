@@ -31,6 +31,7 @@ The package metadata on this development line is `0.4.2`; this is **not a claim 
 | Fused scratch request | Reports the requested row capacity separately from the actual capacity | **Override inactive; actual `TEMP_ROWS_FUSED` remains 2048** |
 | ExLlamaV3 CPU-offload planner | Fail-closed metadata/architecture eligibility plan for an external ExLlamaV3 CPU-MoE experiment | **No CPU-compute executor is implemented in `vllm-exl3`** |
 | **vLLM UVA expert guard** | Requires the six large packed expert payloads to be vLLM UVA-mapped before post-load EXL3 handles/pointers are accepted | **Experimental placement gate only; real-GPU parity/performance not yet qualified** |
+| Tensor-level mixed-K dispatch (branch `feat/grouped-mixed-k-moe`) | Routed experts grouped by physical (gate, up, down) K with one `exl3_moe` launch per group; K1-K8 config acceptance; fat experts use per-projection K | SM120 real-expert fixture only; eager (one host sync per layer); **GB10 not yet qualified** |
 
 Neither enabling the grouped planner nor requesting fewer fused rows currently changes serving allocations or provides a kernel speedup. Planner scratch estimates are not a measurement or bound on every existing runtime allocation.
 
