@@ -10,7 +10,9 @@ from vllm_exl3.mixed_k_guard import install_mixed_k_prescan_guard
 def test_mixed_k_runtime_contract_is_explicit() -> None:
     mixed = vllm_exl3.runtime_diagnostics()["mixed_k"]
     assert mixed["tensor_level_mixed_k_within_layer"] is True
-    assert mixed["heterogeneous_dispatch"] == "python_loop"
+    assert mixed["heterogeneous_dispatch"] == "grouped_exl3_moe_by_k_triple"
+    assert mixed["heterogeneous_fallback"] == "python_loop"
+    assert mixed["config_bits"] == list(range(1, 9))
     assert mixed["uniform_k_dispatch"] == "fused_when_available"
     assert mixed["cudagraph_qualified"] is False
     assert mixed["recommended_first_boot"] == "eager"

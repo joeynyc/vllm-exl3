@@ -20,6 +20,15 @@ def test_k78_config_acceptance_and_restore() -> None:
     assert cfg.bits_for_prefix("model.layers.9.ffn.experts") == 8
 
 
+def test_k1_config_acceptance_and_restore() -> None:
+    vllm_exl3.register()
+    cfg = exl3.Exl3Config(bits=1, layer_bits={"3": 1, "4": 2})
+    assert cfg.bits == 1
+    assert cfg.layer_bits == {3: 1, 4: 2}
+    assert cfg.bits_for_prefix("model.layers.3.ffn.experts") == 1
+    assert cfg.bits_for_prefix("model.layers.9.ffn.experts") == 1
+
+
 def test_k78_non_routed_config_is_restored() -> None:
     vllm_exl3.register()
     nr = {
@@ -32,14 +41,14 @@ def test_k78_non_routed_config_is_restored() -> None:
     assert cfg.non_routed_exl3 == nr
 
 
-def test_config_still_rejects_outside_k2_k8() -> None:
+def test_config_still_rejects_outside_k1_k8() -> None:
     vllm_exl3.register()
-    with pytest.raises(ValueError, match="K2-K8"):
+    with pytest.raises(ValueError, match="K1-K8"):
         exl3.Exl3Config(bits=9)
-    with pytest.raises(ValueError, match="K2-K8"):
-        exl3.Exl3Config(bits=1)
+    with pytest.raises(ValueError, match="K1-K8"):
+        exl3.Exl3Config(bits=0)
 
 
 def test_native_bits_are_not_widened_by_config_compat() -> None:
-    assert supported_config_bits() == (2, 3, 4, 5, 6, 7, 8)
+    assert supported_config_bits() == (1, 2, 3, 4, 5, 6, 7, 8)
     assert native_qualified_bits() == (2, 3, 4)

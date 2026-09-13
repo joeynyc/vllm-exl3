@@ -1,22 +1,22 @@
-"""K7/K8 configuration compatibility for EXL3.
+"""K1 and K7/K8 configuration compatibility for EXL3.
 
-ExLlamaV3's EXL3 execution stack includes K1-K8 fused MoE kernel instances and
-supports the K2-K8 trellis family. vllm-exl3's *custom native p2b* kernels are a
-separate path and intentionally remain limited to the bit widths they have been
-qualified for. Historically Exl3Config rejected K7/K8 before dispatch could use
-ExLlamaV3's normal execution path.
+ExLlamaV3's EXL3 execution stack includes K1-K8 fused MoE kernel instances.
+vllm-exl3's *custom native p2b* kernels are a separate path and intentionally
+remain limited to the bit widths they have been qualified for. Historically
+Exl3Config rejected K1 and K7/K8 before dispatch could use ExLlamaV3's normal
+execution path.
 
-This narrow installer widens *configuration acceptance* to K2-K8 without
-claiming custom-native support for K5-K8. Tensor-level mixed-K inside one
+This narrow installer widens *configuration acceptance* to K1-K8 without
+claiming custom-native support outside K2-K4. Tensor-level mixed-K inside one
 RoutedExperts layer is handled separately by ragged per-expert trellis
-allocation in ``Exl3MoEMethod`` (python_loop when K disagrees).
+allocation in ``Exl3MoEMethod`` and grouped exl3_moe launches per K triple.
 """
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
 
-_ALLOWED = frozenset(range(2, 9))
+_ALLOWED = frozenset(range(1, 9))
 
 
 def _safe_legacy_k(value: object) -> object:
@@ -24,16 +24,18 @@ def _safe_legacy_k(value: object) -> object:
         k = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError):
         return value
-    return 6 if k in (7, 8) else value
+    if k in (7, 8):
+        return 6
+    return 2 if k == 1 else value
 
 
 def _validate_k(value: object, label: str) -> int:
     try:
         k = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} must be an integer K2-K8, got {value!r}") from exc
+        raise ValueError(f"{label} must be an integer K1-K8, got {value!r}") from exc
     if k not in _ALLOWED:
-        raise ValueError(f"unsupported EXL3 {label}={k}; expected K2-K8")
+        raise ValueError(f"unsupported EXL3 {label}={k}; expected K1-K8")
     return k
 
 
@@ -60,10 +62,10 @@ def _sanitize_non_routed(raw: object) -> tuple[object, dict[str, Any] | None]:
 
 
 def install_k78_config_compat(exl3_module: object) -> bool:
-    """Allow K7/K8 config values while preserving custom-native dispatch guards.
+    """Allow K1 and K7/K8 config values while preserving custom-native dispatch guards.
 
     The underlying Exl3Config historically validates K2-K6. During its
-    constructor only, K7/K8 declarations are temporarily represented as K6 so
+    constructor only, K1 declarations are represented as K2 and K7/K8 as K6 so
     unrelated validation/setup runs unchanged. Original K values are restored
     before any layer quant method is created.
     """

@@ -41,7 +41,7 @@ def register() -> None:
     from .tp_geometry_compat import install_tp_geometry_compat
     from .uva_offload import install_uva_expert_validation
 
-    # Accept K7/K8 config values before model-family/runtime wrappers inspect the
+    # Accept K1 and K7/K8 config values before model-family/runtime wrappers inspect the
     # quantization config. ExLlamaV3's normal EXL3 MoE family covers K1-K8;
     # vllm-exl3's custom native p2b path remains independently gated to K2-K4.
     install_k78_config_compat(exl3)
@@ -119,7 +119,8 @@ def runtime_diagnostics():
             "per-expert exact trellis shapes; uniform-K layers keep fused path"
         ),
         "tensor_level_mixed_k_within_layer": True,
-        "heterogeneous_dispatch": "python_loop",
+        "heterogeneous_dispatch": "grouped_exl3_moe_by_k_triple",
+        "heterogeneous_fallback": "python_loop",
         "uniform_k_dispatch": "fused_when_available",
         "fused_k_source": "physical_trellis_geometry",
         "physical_fused_k_guard_installed": bool(
@@ -138,14 +139,16 @@ def runtime_diagnostics():
             "remain hard failures."
         ),
         "note": (
-            "K7/K8 are accepted for ExLlamaV3 execution. The custom native p2b "
+            "K1 and K7/K8 are accepted for ExLlamaV3 execution. The custom native p2b "
             "path remains K2-K4. Routed experts store exact per-expert trellis "
             "shapes (including intra-expert w1/w2/w3 K disagreement). "
-            "Heterogeneous packed K within a layer forces the LinearEXL3 "
-            "python_loop; uniform-K layers still use the fused fast path using "
-            "the K encoded by the loaded trellis, not a config default. "
-            "The heterogeneous path is correctness-first and should remain eager "
-            "until CUDA-graph qualification is completed."
+            "Heterogeneous packed K within a layer is grouped by physical "
+            "(gate, up, down) K with one exl3_moe launch per group; without "
+            "ExLlamaV3's kernel or with EXL3_FUSED_MOE=0 it falls back to the "
+            "LinearEXL3 python_loop. Uniform-K layers keep one fused launch using "
+            "the K encoded by the loaded trellis, not a config default. The grouped "
+            "path takes one host sync per layer to skip empty groups, so it stays "
+            "eager until CUDA-graph qualification is completed."
         ),
     }
     record["tp_geometry"] = {

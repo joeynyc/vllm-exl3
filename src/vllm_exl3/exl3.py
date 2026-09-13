@@ -1195,6 +1195,13 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         layer._exl3_fused_concurrency = 0
         layer._exl3_k = int(layer._exl3_bits)
         return
+    layer._exl3_fused_temps = _fused_temps(device, hidden, intermediate, concurrency)
+    layer._exl3_fused_concurrency = concurrency
+    layer._exl3_k = int(layer._exl3_bits)
+
+
+def _fused_temps(device: torch.device, hidden: int, intermediate: int, concurrency: int):
+    """Shared exl3_moe scratch per device, geometry and concurrency."""
     key = (str(device), hidden, intermediate, concurrency)
     temps = _FUSED_TEMP_CACHE.get(key)
     if temps is None:
@@ -1205,9 +1212,89 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
             torch.empty((concurrency, TEMP_ROWS_FUSED, intermediate), dtype=torch.float16, device=device),
         )
         _FUSED_TEMP_CACHE[key] = temps
-    layer._exl3_fused_temps = temps
+    return temps
+
+
+def _exl3_k_triple(pack: dict[str, Any]) -> tuple[int, int, int]:
+    """Physical (gate, up, down) K from trellis width, never from config."""
+    triple = []
+    for projection in ("gate", "up", "down"):
+        trellis = getattr(pack[projection], "trellis", None)
+        words = int(trellis.shape[-1]) if trellis is not None and getattr(trellis, "ndim", 0) == 3 else 0
+        if words <= 0 or words % 16:
+            raise RuntimeError(f"EXL3 grouped fused state cannot read K for {projection}")
+        triple.append(words // 16)
+    return triple[0], triple[1], triple[2]
+
+
+def build_exl3_grouped_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
+    """Fused state for heterogeneous packed K: one exl3_moe launch per K triple.
+
+    ``exl3_moe`` takes a single K per projection for a whole launch, so experts are
+    grouped by their physical (gate, up, down) K. Each group owns pointer tables over
+    its members and a local->group index whose non-members map to the group's
+    invalid sentinel. Groups share the fused scratch.
+    """
+    exllamav3_ext = load_exllamav3_ext()
+    device = layer.w13_suh.device
+    n_exp = len(inners)
+    for pack in inners:
+        pack["_exl3_gate_up_shared_suh"] = bool(
+            torch.equal(pack["gate"].suh, pack["up"].suh)
+        )
+    by_triple: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+    for e, pack in enumerate(inners):
+        triple = _exl3_k_triple(pack)
+        if not all(1 <= k <= 8 for k in triple):
+            raise RuntimeError(f"EXL3 expert {e} physical K {triple} is outside K1-K8")
+        by_triple[triple].append(e)
+    groups = []
+    # Flat (group, member) slots: each group owns one slot per member plus an unused
+    # sentinel slot, so a single argsort lays every group's routes out contiguously.
+    flat_key = torch.empty(n_exp + 1, dtype=torch.long, device=device)
+    slot_group: list[int] = []
+    slot_valid: list[int] = []
+    base = 0
+    for g, (triple, members) in enumerate(sorted(by_triple.items())):
+        member_ids = torch.tensor(members, dtype=torch.long, device=device)
+        local_to_group = torch.full((n_exp + 1,), len(members), dtype=torch.long, device=device)
+        local_to_group[member_ids] = torch.arange(len(members), dtype=torch.long, device=device)
+        flat_key[member_ids] = torch.arange(base, base + len(members), dtype=torch.long, device=device)
+        slot_group += [g] * (len(members) + 1)
+        slot_valid += [1] * len(members) + [0]
+        ptrs = {
+            f"{which}_{attr}": torch.tensor(
+                [int(getattr(inners[e][which], attr).data_ptr()) for e in members],
+                dtype=torch.int64,
+                device=device,
+            )
+            for which in ("gate", "up", "down")
+            for attr in ("trellis", "suh", "svh")
+        }
+        groups.append(
+            {"k": triple, "members": members, "base": base, "local_to_group": local_to_group, "ptrs": ptrs}
+        )
+        base += len(members) + 1
+    # Routes owned by another path (non-local or fat) sort past every group.
+    flat_key[n_exp] = base
+    idx = int(device.index) if device.index is not None else 0
+    concurrency = 1
+    if hasattr(exllamav3_ext, "exl3_moe_max_concurrency"):
+        concurrency = max(1, int(exllamav3_ext.exl3_moe_max_concurrency(idx)))
+    layer._exl3_k_groups = groups
+    layer._exl3_k_dispatch = {
+        "flat_key": flat_key,
+        "slot_group": torch.tensor(slot_group, dtype=torch.long, device=device),
+        "slot_valid": torch.tensor(slot_valid, dtype=torch.long, device=device),
+        "total": base,
+    }
+    layer._exl3_ptrs = None
+    layer._exl3_fused_temps = _fused_temps(
+        device, int(layer._exl3_hidden_size), int(layer._exl3_intermediate_local), concurrency
+    )
     layer._exl3_fused_concurrency = concurrency
-    layer._exl3_k = int(layer._exl3_bits)
+    # No single K: native p2b and every uniform-K guard must stay off this layer.
+    layer._exl3_k = -1
 
 
 def _native_moe_dimensions_supported(
@@ -1484,20 +1571,26 @@ def apply_exl3_batched_fat(
             # Compatibility fallback for callers that bypass build_exl3_fused_state.
             shared_suh = bool(torch.equal(gate.suh, up.suh))
             inners[e]["_exl3_gate_up_shared_suh"] = shared_suh
-        distinct_suh = not shared_suh
+        # Physical K per projection: mixed-K layers can disagree inside one expert.
+        k = int(gate.trellis.shape[-1]) // 16
+        k_up = int(up.trellis.shape[-1]) // 16
+        k_down = int(down.trellis.shape[-1]) // 16
+        # One packed gate/up reconstruct needs equal suh and equal K; anything else
+        # takes the separate-projection branch with each projection's own K.
+        distinct_suh = not shared_suh or k_up != k
         if not distinct_suh:
             ext.had_r_128(h, h13, gate.suh, None, 1.0)
 
-        packed13 = scratch["packed13"]
-        out_tiles = int(gate.trellis.shape[1])
-        packed13[:, :out_tiles].copy_(gate.trellis)
-        packed13[:, out_tiles:].copy_(up.trellis)
         gate_up = scratch["gate_up"][:n_rows]
-        svh13 = scratch["svh13"]
-        svh13[:intermediate].copy_(gate.svh)
-        svh13[intermediate:].copy_(up.svh)
+        if not distinct_suh:
+            packed13 = scratch["packed13"]
+            out_tiles = int(gate.trellis.shape[1])
+            packed13[:, :out_tiles].copy_(gate.trellis)
+            packed13[:, out_tiles:].copy_(up.trellis)
+            svh13 = scratch["svh13"]
+            svh13[:intermediate].copy_(gate.svh)
+            svh13[intermediate:].copy_(up.svh)
 
-        k = int(getattr(gate, "K", 4))
         mcg = bool(getattr(gate, "mcg", True))
         mul1 = bool(getattr(gate, "mul1", False))
 
@@ -1522,7 +1615,7 @@ def apply_exl3_batched_fat(
                 w_gate = scratch["w_gate"]
                 w_up = scratch["w_up"]
                 ext.reconstruct(w_gate, gate.trellis, k, mcg, mul1)
-                ext.reconstruct(w_up, up.trellis, k, mcg, mul1)
+                ext.reconstruct(w_up, up.trellis, k_up, mcg, mul1)
                 # Contiguous temporaries: ext.hgemm / ext.had_r_128 read and
                 # write row-major contiguous matrices, and a column slice of
                 # ``gate_up`` is neither (see patch_fat_distinct).
@@ -1558,7 +1651,7 @@ def apply_exl3_batched_fat(
         if (
             not distinct_suh
             and use_kernel
-            and k == 4
+            and k_down == 4
             and mcg
             and not mul1
             and native_c is not None
@@ -1571,13 +1664,13 @@ def apply_exl3_batched_fat(
                 down.svh,
                 token_idx,
                 weight_sorted[start:offset],
-                k,
+                k_down,
                 mcg,
                 mul1,
             )
         else:
             w2 = scratch["w2"]
-            ext.reconstruct(w2, down.trellis, k, mcg, mul1)
+            ext.reconstruct(w2, down.trellis, k_down, mcg, mul1)
             down_out = scratch["down"][:n_rows]
             ext.hgemm(h2, w2, down_out)
             ext.had_r_128(down_out, down_out, None, down.svh, 1.0)
@@ -1628,8 +1721,9 @@ def apply_exl3_fused_moe(
         )
 
     ptrs = getattr(layer, "_exl3_ptrs", None)
+    groups = getattr(layer, "_exl3_k_groups", None)
     temps = getattr(layer, "_exl3_fused_temps", None)
-    if not ptrs or temps is None:
+    if (not ptrs and not groups) or temps is None:
         raise RuntimeError("EXL3 fused pointer tables were not built after weight load")
 
     local = map_topk_to_local(ids, n_exp, expert_map)
@@ -1679,52 +1773,49 @@ def apply_exl3_fused_moe(
     # below through the fat GEMM path.
     standard_local = local.masked_fill(fat_route, n_exp)
     standard_weight = flat_weight.masked_fill(fat_route, 0)
-    order = standard_local.argsort()
-    token_sorted = flat_token[order]
-    weight_sorted = standard_weight[order]
-    standard_count = torch.zeros(
-        n_exp + 1, dtype=torch.long, device=local.device
-    )
-    standard_count.scatter_add_(
-        0,
-        standard_local.long(),
-        torch.ones(standard_local.shape, dtype=torch.long, device=local.device),
-    )
     fn = exllamav3_ext.exl3_moe
     # -1 = unknown active count: max-concurrency grid, no .item() host sync.
     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
-
-    k = int(getattr(layer, "_exl3_k", 4))
-    args = (
-        xh,
-        out,
-        standard_count,
-        token_sorted,
-        weight_sorted,
-        temps[0],
-        temps[1],
-        temps[2],
-        temps[3],
-        MOE_ACT_SILU,
-        k,
-        k,
-        k,
-        ptrs["gate_trellis"],
-        ptrs["gate_suh"],
-        ptrs["gate_svh"],
-        ptrs["up_trellis"],
-        ptrs["up_suh"],
-        ptrs["up_svh"],
-        ptrs["down_trellis"],
-        ptrs["down_suh"],
-        ptrs["down_svh"],
-        *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
-        float(limit) if (limit is not None and limit > 0) else 0.0,
-    )
-    if n_active_host is not None:
-        fn(*args, n_active_host)
+    flags = getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False))
+    clamp = float(limit) if (limit is not None and limit > 0) else 0.0
+    if groups:
+        _launch_grouped_exl3_moe(
+            fn,
+            n_active_host,
+            xh,
+            out,
+            flat_token,
+            standard_local,
+            standard_weight,
+            temps,
+            groups,
+            layer._exl3_k_dispatch,
+            flags,
+            clamp,
+        )
     else:
-        fn(*args)
+        order = standard_local.argsort()
+        standard_count = torch.zeros(n_exp + 1, dtype=torch.long, device=local.device)
+        standard_count.scatter_add_(
+            0,
+            standard_local.long(),
+            torch.ones(standard_local.shape, dtype=torch.long, device=local.device),
+        )
+        k = int(getattr(layer, "_exl3_k", 4))
+        _launch_exl3_moe(
+            fn,
+            n_active_host,
+            xh,
+            out,
+            standard_count,
+            flat_token[order],
+            standard_weight[order],
+            temps,
+            (k, k, k),
+            ptrs,
+            flags,
+            clamp,
+        )
 
     if fat_possible and bool(fat.any().item()):
         fat_order = local.argsort()
@@ -1740,6 +1831,84 @@ def apply_exl3_fused_moe(
             use_kernel=_fat_kernel_available(),
         )
     return out
+
+
+_EXL3_MOE_PTR_KEYS = tuple(
+    f"{which}_{attr}" for which in ("gate", "up", "down") for attr in ("trellis", "suh", "svh")
+)
+
+
+def _launch_exl3_moe(
+    fn, n_active_host, xh, out, count, token_sorted, weight_sorted, temps, ks, ptrs, flags, clamp
+) -> None:
+    args = (
+        xh,
+        out,
+        count,
+        token_sorted,
+        weight_sorted,
+        temps[0],
+        temps[1],
+        temps[2],
+        temps[3],
+        MOE_ACT_SILU,
+        *ks,
+        *(ptrs[key] for key in _EXL3_MOE_PTR_KEYS),
+        *flags,
+        clamp,
+    )
+    if n_active_host is not None:
+        fn(*args, n_active_host)
+    else:
+        fn(*args)
+
+
+def _launch_grouped_exl3_moe(
+    fn, n_active_host, xh, out, flat_token, local, weight, temps, groups, dispatch, flags, clamp
+) -> None:
+    """One exl3_moe launch per physical (gate, up, down) K group, straight into ``out``.
+
+    Routes are sorted once by (group, member) slot, so each group's routes form one
+    contiguous slice that the kernel reads from offset 0 with the group's own counts.
+    ``local`` carries the layer sentinel on routes another path owns (non-local or
+    fat); those sort past every group. exl3_moe scatter-adds into its output, so the
+    groups accumulate without scratch buffers.
+    """
+    key = dispatch["flat_key"].index_select(0, local.long())
+    order = key.argsort()
+    total = int(dispatch["total"])
+    counts = torch.zeros(total + 1, dtype=torch.long, device=key.device)
+    counts.scatter_add_(0, key, torch.ones_like(key))
+    slots = counts[:total] * dispatch["slot_valid"]
+    n_groups = len(groups)
+    routes = torch.zeros(n_groups, dtype=torch.long, device=key.device)
+    routes.scatter_add_(0, dispatch["slot_group"], slots)
+    active = torch.zeros(n_groups, dtype=torch.long, device=key.device)
+    active.scatter_add_(0, dispatch["slot_group"], (slots > 0).long())
+    # One host sync per layer sizes the slices and skips empty groups; this path is eager-only.
+    routes_host, active_host = torch.stack([routes, active]).tolist()
+    token_sorted = flat_token[order]
+    weight_sorted = weight[order]
+    start = 0
+    for group, n_routes, n_active in zip(groups, routes_host, active_host):
+        if n_routes == 0:
+            continue
+        base, n_members = int(group["base"]), len(group["members"])
+        _launch_exl3_moe(
+            fn,
+            n_active if n_active_host is not None else None,
+            xh,
+            out,
+            counts[base : base + n_members + 1],
+            token_sorted[start : start + n_routes],
+            weight_sorted[start : start + n_routes],
+            temps,
+            group["k"],
+            group["ptrs"],
+            flags,
+            clamp,
+        )
+        start += n_routes
 
 
 def apply_exl3_experts(
@@ -1785,7 +1954,9 @@ def apply_exl3_experts(
             layer._exl3_last_apply = "native"
             return native_out.to(dtype=x.dtype)
 
-    have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
+    have_ptrs = bool(getattr(layer, "_exl3_ptrs", None)) or bool(
+        getattr(layer, "_exl3_k_groups", None)
+    )
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
     use_fused = (fused_moe_enabled() if fused is None else bool(fused)) and have_ptrs
@@ -2741,14 +2912,26 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             layer._exl3_codebook_flags = flags
         fused_ok = False
         fused_err = None
-        # Fused/native MoE launches take a single K for gate/up/down across the
-        # whole layer. Heterogeneous packed K must use the LinearEXL3 loop.
+        layer._exl3_k_groups = None
+        # Fused/native MoE launches take a single K for gate/up/down per launch.
+        # Heterogeneous packed K launches exl3_moe once per physical K triple and
+        # falls back to the LinearEXL3 loop without ExLlamaV3's kernel.
         backend = get_moe_kernel_backend()
         if mixed_k:
             fused_err = f"mixed_packed_K={sorted(set(k_values))}"
             layer._exl3_ptrs = None
             layer._exl3_fused_temps = None
             layer._exl3_fused_concurrency = 0
+            if fused_moe_enabled() and _exllamav3_moe_available():
+                try:
+                    build_exl3_grouped_fused_state(layer, inners)
+                    fused_ok, fused_err = True, None
+                except Exception as exc:
+                    fused_err = f"{fused_err} grouped_state={exc!r}"
+                    layer._exl3_k_groups = None
+                    layer._exl3_k_dispatch = None
+                    layer._exl3_fused_temps = None
+                    layer._exl3_fused_concurrency = 0
         elif fused_moe_enabled() or backend == "native":
             try:
                 has_native = backend == "native" and native_moe_kernel_available()
@@ -2773,12 +2956,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 logger.info(
                     "EXL3 MCG trellis engaged for routed experts: bits=%s "
                     "experts_local=%s hidden=%s intermediate_local=%s "
-                    "fused_moe=exl3_moe concurrency=%s "
+                    "fused_moe=%s concurrency=%s "
                     "(no BF16 expert reconstruct at load)",
                     self.bits,
                     n_exp,
                     layer._exl3_hidden_size,
                     layer._exl3_intermediate_local,
+                    (
+                        f"exl3_moe_grouped k_groups={len(layer._exl3_k_groups)}"
+                        if layer._exl3_k_groups
+                        else "exl3_moe"
+                    ),
                     getattr(layer, "_exl3_fused_concurrency", "?"),
                 )
             else:

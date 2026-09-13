@@ -199,5 +199,5 @@ def test_runtime_diagnostics_advertise_tensor_level_mixed_k() -> None:
     diag = vllm_exl3.runtime_diagnostics()
     mixed = diag["mixed_k"]
     assert mixed["tensor_level_mixed_k_within_layer"] is True
-    assert mixed["heterogeneous_dispatch"] == "python_loop"
-    assert "python_loop" in mixed["note"]
+    assert mixed["heterogeneous_dispatch"] == "grouped_exl3_moe_by_k_triple"
+    assert "grouped" in mixed["note"] and "python_loop" in mixed["note"]
