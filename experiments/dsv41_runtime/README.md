@@ -6,6 +6,9 @@ asynchronous expert reads, Engram row caching, and the later native service and
 CUDA graph fixes. It is an experimental source handoff for review and porting.
 It does not change the installed plugin or qualify current main for this mode.
 
+The campaign is now closed. [FINAL_NOTES.md](FINAL_NOTES.md) records the last
+qualified result, the rejected follow-up experiments, and the limits that remain.
+
 The earlier component PR supplied reusable pieces without the loader and kernel
 integration. This bundle includes those dependencies and the historical versions
 needed to inspect the progression. The existing safetensors repair remains a
